@@ -92,9 +92,10 @@ def test_parse_ical_datetime_utc():
     assert dt == datetime(2026, 5, 1, 14, 30, 0, tzinfo=timezone.utc)
 
 
-def test_parse_ical_datetime_naive():
+def test_parse_ical_datetime_without_zone_is_moscow_time():
     dt = _parse_ical_datetime("20260501T143000")
-    assert dt == datetime(2026, 5, 1, 14, 30, 0)
+    assert dt == datetime(2026, 5, 1, 14, 30, 0, tzinfo=MSK)
+    assert dt.utcoffset().total_seconds() == 3 * 3600
 
 
 def test_parse_ical_datetime_date_only():
@@ -465,3 +466,10 @@ async def test_close_is_idempotent():
     svc = MireaSchedule()
     await svc.close()
     await svc.close()  # second close should not raise
+
+
+def test_ical_event_without_zone_keeps_its_moscow_instant_in_export():
+    from pymirea.schedule import _ical_to_event
+    event = _ical_to_event({"DTSTART": "20260501T090000", "DTEND": "20260501T103000", "SUMMARY": "Матанализ"})
+    assert event.start == datetime(2026, 5, 1, 6, 0, tzinfo=timezone.utc)
+    assert _ics_format_dt(event.start) == "20260501T060000Z"

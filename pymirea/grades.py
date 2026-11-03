@@ -22,7 +22,7 @@ import re
 import struct
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -2102,27 +2102,27 @@ class MireaGrades:
             return float(seconds) + float(nanos) / 1e9
         return None
 
-    async def get_schedule(self, days: int = 7) -> ScheduleResult:
-        """Fetch schedule for the next N days via Pulse LessonService."""
+    async def get_schedule(self, days: int = 7, *, start_date: date | None = None) -> ScheduleResult:
+        """Fetch N calendar days via Pulse LessonService, from start_date (Moscow today by default)."""
         ok, err = await self._ensure_pulse_cookie()
         if not ok:
             return ScheduleResult(success=False, message=err or "Auth failed")
 
         all_lessons: list[ScheduleLesson] = []
         from zoneinfo import ZoneInfo
-        now = datetime.now(ZoneInfo("Europe/Moscow"))
+        first_day = start_date or datetime.now(ZoneInfo("Europe/Moscow")).date()
         failures = []
 
         sem = asyncio.Semaphore(5)
 
         async def _fetch_day(offset: int) -> list[ScheduleLesson]:
-            dt = now + timedelta(days=offset)
+            dt = first_day + timedelta(days=offset)
             payload = self._encode_date_request(dt.year, dt.month, dt.day)
             async with sem:
                 raw, grpc_err = await self._grpc_unary(self.LESSONS_URL, payload)
             if grpc_err:
                 failures.append(grpc_err)
-                logger.debug(f"Schedule fetch for {dt.date()}: {grpc_err}")
+                logger.debug("Schedule fetch for %s: %s", dt, grpc_err)
                 return []
             if not raw:
                 return []
