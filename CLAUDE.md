@@ -20,6 +20,8 @@
 
 **4a. Не отправляй в SSO cookies потока входа** (`AUTH_SESSION_ID`, `KC_*`): после завершённого входа они устаревают, и Keycloak гоняет запрос по кругу до `TooManyRedirects`. Сессию определяют `KEYCLOAK_IDENTITY`/`KEYCLOAK_SESSION`.
 
+**4c. Восстановление сессии одно на всех:** `pymirea.grades.renew_pulse_session(cookies)` (bootstrap через Keycloak-сессию, затем refresh токена). Им пользуются `MireaGrades`, `MireaAPI` (через grades) и `MireaACS`. Новый клиент Pulse должен вызывать его на 401 / gRPC 7, 16 / HTML-логине, а не только `try_refresh_tokens`. `MireaEsports` сюда не относится: у киберзоны свой вход через `login.mirea.ru` и JWT.
+
 **4b. Keycloak-сессия без «запомнить меня» живёт 16 часов**, с `rememberMe=on` — около полугода. Мёртвую сессию bootstrap помечает `__pulse_bootstrap_failed_at`; приложение по `pulse_session_needs_login()` должно просить новый вход, а не повторять ошибку.
 
 **5. Token exchange может вернуть 400 даже когда логин успешен** (confidential client). Падение exchange ≠ падение логина. Если есть KC cookies, можно работать через `.AspNetCore.Cookies` без access_token.
@@ -55,7 +57,7 @@ python3 -m pytest tests/ -q
 python3 -m ruff check .  # CI ругается на F401 unused imports — прогоняй перед коммитом
 ```
 
-212 тестов, HTTP мокается через respx или `httpx.MockTransport` (подмена `make_async_client`). Реальная МИРЭА в CI **не дёргается** — только моки. Любое тестирование против настоящего МИРЭА надо делать вручную с осторожностью (риск flag/ban аккаунта).
+247 тестов, HTTP мокается через respx или `httpx.MockTransport` (подмена `make_async_client`). Каждое сообщение об ошибке, которое отдаёт библиотека, должно быть в `tests/test_result_errors.py`: от него зависит `raise_for_error()`. Реальная МИРЭА в CI **не дёргается** — только моки. Любое тестирование против настоящего МИРЭА надо делать вручную с осторожностью (риск flag/ban аккаунта).
 
 ## Релиз
 
