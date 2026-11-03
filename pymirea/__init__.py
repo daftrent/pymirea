@@ -33,6 +33,7 @@ from .exceptions import (
     MireaRefreshFailed,
     MireaServerError,
     MireaSessionExpired,
+    error_from_message,
 )
 from .pulse_session import has_pulse_auth_cookie, pulse_session_needs_login
 from .schedule import (
@@ -73,6 +74,7 @@ __all__ = [
     "MireaRateLimited",
     "MireaServerError",
     "MireaParseFailed",
+    "error_from_message",
     "ensure_fresh_token",
     "has_pulse_auth_cookie",
     "pulse_session_needs_login",

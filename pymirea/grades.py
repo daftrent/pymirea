@@ -29,6 +29,7 @@ import httpx
 
 from ._http import make_async_client
 from ._settings import settings
+from .exceptions import RaisesForError
 from .pulse_session import (
     BOOTSTRAP_FAILED_AT_KEY,
     BOOTSTRAP_RETRY_AFTER_S,
@@ -68,7 +69,7 @@ class Subject:
 
 
 @dataclass
-class GradesResult:
+class GradesResult(RaisesForError):
     success: bool
     message: str
     subjects: list[Subject] | None = None
@@ -104,7 +105,7 @@ class ScheduleLesson:
 
 
 @dataclass
-class ScheduleResult:
+class ScheduleResult(RaisesForError):
     success: bool
     message: str
     lessons: list[ScheduleLesson] | None = None
@@ -125,7 +126,7 @@ class AttendanceSummary:
 
 
 @dataclass
-class AttendanceDetailResult:
+class AttendanceDetailResult(RaisesForError):
     success: bool
     message: str
     summary: AttendanceSummary | None = None
