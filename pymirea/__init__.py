@@ -34,6 +34,7 @@ from .exceptions import (
     MireaServerError,
     MireaSessionExpired,
 )
+from .pulse_session import has_pulse_auth_cookie, pulse_session_needs_login
 from .schedule import (
     ClassroomInfo,
     GroupInfo,
@@ -73,10 +74,12 @@ __all__ = [
     "MireaServerError",
     "MireaParseFailed",
     "ensure_fresh_token",
+    "has_pulse_auth_cookie",
+    "pulse_session_needs_login",
     "get_authorization_header",
     "get_token_age_seconds",
     "get_token_exp",
     "try_refresh_tokens",
 ]
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

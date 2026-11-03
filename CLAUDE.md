@@ -4,7 +4,7 @@
 
 **Это reverse-engineered клиент закрытого API.** Никаких `.proto` файлов нет, схемы протобуфа никто не публиковал. Всё что в коде — результат раскрутки трафика реального фронта `pulse.mirea.ru`. Если МИРЭА что-то меняют — мы узнаём по падению успешности у пользователей, не из release notes.
 
-**1 апреля 2026 МИРЭА сделали ломающие изменения:** переименовали gRPC методы на `rtu_tc.attendance.api.*` (раньше было что-то на `session.SessionService`), добавили required-action `max-account-config` после OTP, token exchange стал confidential client (нужен бутстрап `.AspNetCore.Cookies` через pulse). Если код в дальнейшем сломается похожим образом — это не баг pymirea, это они снова что-то накатили; смотри начала с auth flow и gRPC путей.
+**1 апреля 2026 МИРЭА сделали ломающие изменения:** переименовали gRPC методы на `rtu_tc.attendance.api.*` (раньше было что-то на `session.SessionService`), добавили required-action `max-account-config` после OTP, token exchange стал confidential client (нужен бутстрап `.AspNetCore.Cookies` через pulse). **6 октября 2026 снова:** cookie сессии переименована в `Pulse.Auth.Cookie`, `/api/baseinfo` удалён, метод отчёта БРС удалён, HTML `/selfapprove` отдаёт только оболочку SPA, вход идёт через PAR на стороне Пульса (с 08.10). Всё это перенесено в 0.5.0 из продакшена Pairx (`qrscaner`), подробности в CHANGELOG. Если код в дальнейшем сломается похожим образом — это не баг pymirea, это они снова что-то накатили; смотри начала с auth flow и gRPC путей.
 
 ## Auth flow подводные камни
 
@@ -16,7 +16,11 @@
 
 **3. Required-action HTML содержит `"login-max-otp"` в kcContext** (это название frontend-шаблона, не настоящий OTP-челлендж). `_extract_otp_challenge` будет его ошибочно матчить как новый 2FA. **Сначала проверяй URL на `required-action`, потом на OTP.**
 
-**4. Без `.AspNetCore.Cookies` все gRPC вызовы возвращают 401.** Этот cookie выдаёт `pulse.mirea.ru/api/auth/login?redirectUri=/api/baseinfo` если послать туда KC-сессионные cookies. После любого успешного login → bootstrap AspNet cookie, иначе пользователь "залогинился" но ничего не работает.
+**4. Без cookie Пульса все gRPC вызовы возвращают 401.** С 06.10.2026 это `Pulse.Auth.Cookie` (раньше `.AspNetCore.Cookies`, имена и параметры — `pulse_session.py`). Её выдаёт `pulse.mirea.ru/api/auth/login?redirectUri=https://pulse.mirea.ru/&rememberMe=True` при живой Keycloak-сессии. Bootstrap принимает любую cookie, выданную самим `pulse.mirea.ru`, и выкидывает старую копию с `.mirea.ru`, иначе уйдут обе одноимённые.
+
+**4a. Не отправляй в SSO cookies потока входа** (`AUTH_SESSION_ID`, `KC_*`): после завершённого входа они устаревают, и Keycloak гоняет запрос по кругу до `TooManyRedirects`. Сессию определяют `KEYCLOAK_IDENTITY`/`KEYCLOAK_SESSION`.
+
+**4b. Keycloak-сессия без «запомнить меня» живёт 16 часов**, с `rememberMe=on` — около полугода. Мёртвую сессию bootstrap помечает `__pulse_bootstrap_failed_at`; приложение по `pulse_session_needs_login()` должно просить новый вход, а не повторять ошибку.
 
 **5. Token exchange может вернуть 400 даже когда логин успешен** (confidential client). Падение exchange ≠ падение логина. Если есть KC cookies, можно работать через `.AspNetCore.Cookies` без access_token.
 
@@ -51,9 +55,11 @@ python3 -m pytest tests/ -q
 python3 -m ruff check .  # CI ругается на F401 unused imports — прогоняй перед коммитом
 ```
 
-92 теста, все мокают HTTP через respx. Реальная МИРЭА в CI **не дёргается** — только моки. Любое тестирование против настоящего МИРЭА надо делать вручную с осторожностью (риск flag/ban аккаунта).
+212 тестов, HTTP мокается через respx или `httpx.MockTransport` (подмена `make_async_client`). Реальная МИРЭА в CI **не дёргается** — только моки. Любое тестирование против настоящего МИРЭА надо делать вручную с осторожностью (риск flag/ban аккаунта).
 
 ## Релиз
+
+Теги v0.3.4–v0.4.0 не ставились, поэтому на PyPI до 0.5.0 была 0.3.3. Проверяй после релиза, что версия появилась на PyPI.
 
 1. Бамп версии в `pyproject.toml`
 2. Коммит на `main` (солопроект, PR не обязателен)
