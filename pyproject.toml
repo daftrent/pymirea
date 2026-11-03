@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pymirea"
-version = "0.4.0"
+version = "0.5.0"
 description = "Async Python client for Мирэа LKS (schedule, grades, attendance, ACS, SSO)"
 readme = "README.md"
 requires-python = ">=3.11"
