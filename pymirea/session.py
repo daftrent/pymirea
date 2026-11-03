@@ -1,10 +1,12 @@
 """
-Сервис для работы с API МИРЭА (pulse.mirea.ru)
+Сервис отметки посещаемости МИРЭА.
 
 QR-код содержит URL вида:
 https://pulse.mirea.ru/selfapprove?token=UUID
 
-Для отметки нужна авторизованная сессия через SSO МИРЭА.
+Отметка выполняется через gRPC-Web API «Пульса» (pulse.mirea.ru). HTML-страница
+/selfapprove с конца сентября 2026 отдаёт только оболочку веб-приложения, поэтому
+запасного пути через неё больше нет (см. CHANGELOG 0.5.0).
 """
 import json
 import re
@@ -16,7 +18,6 @@ import httpx
 from ._http import make_async_client
 from ._settings import settings
 from .tokens import try_refresh_tokens
-from .upstreams import get_breaker
 
 
 @dataclass
@@ -130,10 +131,10 @@ class MireaAPI:
     async def _mark_attendance_via_grpc(
         self,
         token: str,
-    ) -> AttendanceResult | None:
+    ) -> AttendanceResult:
         """
-        Try gRPC self-approve flow used by pulse.mirea.ru.
-        Returns AttendanceResult when gRPC gives a clear answer, else None.
+        Self-approve through the Pulse gRPC-Web API, the only attendance endpoint the
+        university still serves. Always returns a result with the real reason.
         """
         import logging
         logger = logging.getLogger(__name__)
@@ -142,13 +143,16 @@ class MireaAPI:
             grades_api = MireaGrades(self.session_cookies)
             try:
                 approved, message = await grades_api.self_approve_attendance(token)
-                # Persist any refreshed cookies (e.g., .AspNetCore.Cookies)
+                # Persist any refreshed cookies and tokens (Pulse.Auth.Cookie, access_token).
                 self.session_cookies.update(grades_api.session_cookies)
             finally:
                 await grades_api.close()
         except Exception as e:
             logger.warning(f"gRPC self-approve failed: {e}")
-            return None
+            return AttendanceResult(
+                success=False,
+                message="МИРЭА временно недоступна. Попробуйте ещё раз.",
+            )
 
         if approved is True:
             return AttendanceResult(
@@ -162,14 +166,12 @@ class MireaAPI:
                 message=message or "Отметка пока недоступна",
             )
 
-        # approved is None -> gRPC error or unknown response
-        if message and ("Перелогиньтесь" in message or "Сессия истекла" in message):
-            return AttendanceResult(
-                success=False,
-                message=message,
-            )
+        # approved is None: the session expired, the upstream is unavailable or answered an error.
         logger.info(f"gRPC self-approve unclear: {message}")
-        return None
+        return AttendanceResult(
+            success=False,
+            message=message or "Не удалось отметиться. Попробуйте ещё раз.",
+        )
 
     async def mark_attendance(self, qr_data: str, *, _refreshed: bool = False) -> AttendanceResult:
         """
@@ -182,183 +184,17 @@ class MireaAPI:
                 message=error or "Не удалось извлечь токен из QR-кода"
             )
 
-        # Prefer gRPC self-approve (official webapp flow)
+        refreshed_before = self.session_cookies.get("__token_refreshed_at")
         grpc_result = await self._mark_attendance_via_grpc(token)
-        if grpc_result is not None:
-            # If upstream says session expired, try refresh-token flow once.
-            msg = (grpc_result.message or "").lower()
-            looks_expired = ("перелог" in msg) or ("сессия истек" in msg) or ("needs_auth" in msg)
-            if (not grpc_result.success) and (not _refreshed) and looks_expired:
-                refreshed = await try_refresh_tokens(self.session_cookies)
-                if refreshed:
-                    grpc_retry = await self._mark_attendance_via_grpc(token)
-                    if grpc_retry is not None:
-                        return grpc_retry
-            return grpc_result
-
-        try:
-            breaker = get_breaker("mirea_attendance_app")
-            decision = await breaker.allow()
-            if not decision.allowed:
-                retry_after = decision.retry_after_s or 5
-                return AttendanceResult(
-                    success=False,
-                    message=f"МИРЭА временно недоступна. Попробуйте через {retry_after} сек.",
-                )
-
-            # Делаем GET запрос на selfapprove с токеном
-            url = f"{self.BASE_URL}{self.SELFAPPROVE_ENDPOINT}"
-            response = await self.client.get(url, params={"token": token})
-
-            # Анализируем ответ
-            text = response.text
-            text_lower = text.lower()
-
-            # Логируем для отладки
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.info(f"MIREA selfapprove [{response.status_code}] URL: {response.url}")
-            logger.info(f"MIREA Response headers: {dict(response.headers)}")
-            logger.info(f"MIREA Response body ({len(text)} chars): {text[:1000]}")
-
-            # Проверяем, не вернул ли сервер JSON вместо HTML
-            content_type = response.headers.get("content-type", "")
-            if "application/json" in content_type:
-                try:
-                    json_data = response.json()
-                    logger.info(f"MIREA JSON response: {json_data}")
-                    # Если есть поле success/status в JSON
-                    if json_data.get("success") or json_data.get("status") == "ok":
-                        return AttendanceResult(
-                            success=True,
-                            message="Посещаемость отмечена",
-                        )
-                    elif "error" in json_data or json_data.get("success") is False:
-                        return AttendanceResult(
-                            success=False,
-                            message=json_data.get("message", json_data.get("error", "Ошибка сервера"))
-                        )
-                except Exception:
-                    pass
-
-            # Проверяем финальный URL после редиректов
-            final_url = str(response.url)
-            logger.info(f"MIREA final URL after redirects: {final_url}")
-
-            # Если нас редиректнуло на страницу логина - сессия истекла
-            from urllib.parse import urlparse as _urlparse
-            _final_host = _urlparse(final_url).hostname or ""
-            if "login" in _final_host or _final_host == "sso.mirea.ru":
-                return AttendanceResult(
-                    success=False,
-                    message="Сессия истекла. Перелогиньтесь в МИРЭА."
-                )
-
-            if response.status_code == 200:
-                await breaker.record_success()
-                # Проверяем, не пустой ли ответ или SPA-заглушка
-                is_spa_shell = (
-                    len(text) < 500 and "<div id=" in text_lower and "script" in text_lower
-                ) or (
-                    "<!doctype html>" in text_lower and len(text) < 2000 and text.count("<script") > 2
-                )
-
-                if is_spa_shell:
-                    logger.warning("MIREA returned SPA shell - cannot parse content")
-                    return AttendanceResult(
-                        success=False,
-                        message="Сервер вернул SPA без результата. Попробуйте позже или откройте ссылку вручную.",
-                    )
-
-                # Проверяем явные индикаторы УСПЕХА
-                success_markers = [
-                    "успешно отмечен",
-                    "посещение зафиксировано",
-                    "вы отмечены",
-                    "отметка принята",
-                    "attendance recorded",
-                    "successfully marked",
-                    "ваше присутствие",
-                    "присутствие подтверждено",
-                ]
-                is_success = any(marker in text_lower for marker in success_markers)
-
-                # Проверяем явные индикаторы ОШИБКИ
-                auth_markers = ["авторизац", "войти", "login", "sign in", "unauthorized"]
-                expired_markers = ["истек", "expired", "недействителен", "invalid token", "not found"]
-                already_markers = ["уже отмечен", "already marked", "повторн"]
-
-                is_auth_error = any(marker in text_lower for marker in auth_markers)
-                is_expired = any(marker in text_lower for marker in expired_markers)
-                is_already = any(marker in text_lower for marker in already_markers)
-
-                if is_success:
-                    return AttendanceResult(
-                        success=True,
-                        message="Посещаемость отмечена",
-                    )
-                elif is_already:
-                    return AttendanceResult(
-                        success=True,
-                        message="Вы уже отмечены на этом занятии",
-                    )
-                elif is_auth_error:
-                    return AttendanceResult(
-                        success=False,
-                        message="Сессия истекла. Перелогиньтесь в МИРЭА."
-                    )
-                elif is_expired:
-                    return AttendanceResult(
-                        success=False,
-                        message="QR-код недействителен или истёк"
-                    )
-                else:
-                    logger.warning("Unknown MIREA response")
-                    return AttendanceResult(
-                        success=False,
-                        message="Неизвестный ответ сервера. Проверьте вручную.",
-                    )
-
-            elif response.status_code == 401 or response.status_code == 403:
-                await breaker.record_success()
-                return AttendanceResult(
-                    success=False,
-                    message="Сессия истекла. Перелогиньтесь в МИРЭА."
-                )
-            elif response.status_code == 404:
-                await breaker.record_success()
-                return AttendanceResult(
-                    success=False,
-                    message="QR-код не найден или недействителен"
-                )
-            else:
-                if 500 <= int(response.status_code) <= 599:
-                    await breaker.record_failure()
-                else:
-                    await breaker.record_success()
-                return AttendanceResult(
-                    success=False,
-                    message=f"Ошибка сервера МИРЭА: {response.status_code}"
-                )
-
-        except httpx.TimeoutException:
-            try:
-                await get_breaker("mirea_attendance_app").record_failure()
-            except Exception:
-                pass
-            return AttendanceResult(
-                success=False,
-                message="Сервер МИРЭА не отвечает (timeout)"
-            )
-        except Exception:
-            try:
-                await get_breaker("mirea_attendance_app").record_failure()
-            except Exception:
-                pass
-            return AttendanceResult(
-                success=False,
-                message="Ошибка отметки посещаемости"
-            )
+        # If upstream says the session expired, try the refresh-token flow once. The gRPC call
+        # refreshes by itself on HTTP 401; do not repeat it when that already happened.
+        msg = (grpc_result.message or "").lower()
+        looks_expired = ("перелог" in msg) or ("сессия истек" in msg) or ("needs_auth" in msg)
+        already_refreshed = self.session_cookies.get("__token_refreshed_at") != refreshed_before
+        if (not grpc_result.success) and (not _refreshed) and looks_expired and not already_refreshed:
+            if await try_refresh_tokens(self.session_cookies):
+                return await self._mark_attendance_via_grpc(token)
+        return grpc_result
 
     async def mark_attendance_for_group(
         self,
