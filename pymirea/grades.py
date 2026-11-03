@@ -2140,3 +2140,21 @@ class MireaGrades:
 
     async def close(self) -> None:
         await self.client.aclose()
+
+
+async def renew_pulse_session(session_cookies: dict) -> bool:
+    """
+    Renew the Pulse session after Pulse rejected a call (HTTP 401, gRPC 7/16).
+
+    Asks Pulse for a new auth cookie through the stored Keycloak session and falls
+    back to the Keycloak token refresh. Updates ``session_cookies`` in place, so other
+    clients (ACS, attendance) holding the same dict can pick the new cookie up.
+    Returns True when something was renewed and the call is worth repeating once.
+    """
+    if not session_cookies:
+        return False
+    grades = MireaGrades(session_cookies)
+    try:
+        return await grades._recover_session()
+    finally:
+        await grades.close()
