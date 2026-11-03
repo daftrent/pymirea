@@ -2,10 +2,10 @@
 Сервис для получения баллов БРС (learn-rating-system) через gRPC-Web API.
 
 Ключевой момент: браузер/Pulse не ходит в эти gRPC методы с Bearer токеном.
-Он использует cookie `.AspNetCore.Cookies` на `attendance.mirea.ru`.
-Эта cookie появляется после перехода на:
+Он использует httpOnly cookie `Pulse.Auth.Cookie` на `pulse.mirea.ru`
+(до 06.10.2026 она называлась `.AspNetCore.Cookies`). Cookie появляется после перехода на:
 
-  https://pulse.mirea.ru/api/auth/login?redirectUri=%2Fapi%2Fbaseinfo
+  https://pulse.mirea.ru/api/auth/login?redirectUri=https%3A%2F%2Fpulse.mirea.ru%2F&rememberMe=False
 
 при наличии активной Keycloak-сессии (cookies `KEYCLOAK_IDENTITY/KEYCLOAK_SESSION` и др).
 
@@ -29,6 +29,18 @@ import httpx
 
 from ._http import make_async_client
 from ._settings import settings
+from .pulse_session import (
+    BOOTSTRAP_FAILED_AT_KEY,
+    BOOTSTRAP_RETRY_AFTER_S,
+    LEGACY_PULSE_AUTH_COOKIE,
+    PULSE_AUTH_COOKIE,
+    PULSE_LOGIN_PARAMS,
+    SESSION_EXPIRED_MESSAGE,
+    has_pulse_auth_cookie,
+    is_keycloak_flow_cookie,
+    is_pulse_auth_cookie,
+    pulse_issued_cookies,
+)
 from .tokens import get_authorization_header, try_refresh_tokens
 from .upstreams import get_breaker
 
@@ -46,6 +58,13 @@ class Subject:
     achievements: float = 0.0  # Достижения (Макс. 10)
     additional: float = 0.0  # Дополнительные (Макс. 10)
     total: float = 0.0  # Всего баллов (Макс. 120)
+    # Maxima as Pulse reports them for this discipline and semester (they changed in 2026/27).
+    current_control_max: float | None = None
+    semester_control_max: float | None = None
+    attendance_max: float | None = None
+    achievements_max: float | None = None
+    additional_max: float | None = None
+    total_max: float | None = None
 
 
 @dataclass
@@ -54,6 +73,23 @@ class GradesResult:
     message: str
     subjects: list[Subject] | None = None
     semester: str | None = None
+
+
+@dataclass
+class _LrsEntry:
+    """One discipline in one semester as GetAttendancesAndLRSByDisciplinesIds reports it."""
+
+    discipline_id: str
+    title: str
+    year_id: str
+    part_id: str
+    eswpe_id: str
+    scores: dict[str, float]
+    max_scores: dict[str, float]
+    summary_score: float | None
+    summary_max: float | None
+    potential_attendance: float | None
+    lessons_ahead: int
 
 
 @dataclass
@@ -116,7 +152,7 @@ class MireaGrades:
     """
     Получение оценок из БРС МИРЭА через gRPC-Web (как в Pulse).
 
-    Важное: перед gRPC вызовами нужно убедиться, что есть `.AspNetCore.Cookies`.
+    Важное: перед gRPC вызовами нужно убедиться, что есть `Pulse.Auth.Cookie`.
     """
 
     APP_URL = "https://pulse.mirea.ru"
@@ -147,6 +183,14 @@ class MireaGrades:
         "https://pulse.mirea.ru/"
         "rtu_tc.attendance.api.LessonService/GetAvailableLessonsOfVisitingLogs"
     )
+    TERM_PLANS_URL = (
+        "https://pulse.mirea.ru/"
+        "rtu_tc.student.api.StudentService/GetStudentTermPlansWithDisciplines"
+    )
+    LRS_BY_DISCIPLINES_URL = (
+        "https://pulse.mirea.ru/"
+        "rtu_tc.attendance.api.LearnRatingScoreService/GetAttendancesAndLRSByDisciplinesIds"
+    )
 
     _UUID_RE = re.compile(
         r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -173,6 +217,11 @@ class MireaGrades:
                 continue
             if str(name).startswith("__"):
                 continue
+            if is_keycloak_flow_cookie(str(name)):
+                # Keycloak's per-login flow cookies are stale once that login finished; replaying
+                # them makes SSO restart its flow in a redirect loop. The session cookies
+                # (KEYCLOAK_IDENTITY, KEYCLOAK_SESSION) are what identifies the user.
+                continue
             # Make cookies available for all *.mirea.ru hosts to survive redirects between subdomains.
             cookies.set(str(name), str(value), domain=".mirea.ru")
 
@@ -193,16 +242,56 @@ class MireaGrades:
 
     # --- Auth bootstrap ---
 
-    async def _ensure_aspnet_cookie(self) -> tuple[bool, str | None]:
+    def _has_pulse_auth_cookie(self) -> bool:
+        if has_pulse_auth_cookie(self.session_cookies):
+            return True
+        return any(is_pulse_auth_cookie(c.name or "") and c.value for c in self.client.cookies.jar)
+
+    def _adopt_pulse_cookies(self, fresh: dict[str, str]) -> None:
+        """Persist cookies Pulse just issued and drop the stale copies they replace."""
+        jar = self.client.cookies.jar
+        for name, value in fresh.items():
+            # The stored copy was loaded for `.mirea.ru`; two cookies with one name would be sent together.
+            try:
+                jar.clear(".mirea.ru", "/", name)
+            except KeyError:
+                pass
+            self.session_cookies[name] = value
+        if any(is_pulse_auth_cookie(name, PULSE_AUTH_COOKIE) for name in fresh):
+            for name in [n for n in self.session_cookies if is_pulse_auth_cookie(n, LEGACY_PULSE_AUTH_COOKIE)]:
+                self.session_cookies.pop(name, None)
+                try:
+                    jar.clear(".mirea.ru", "/", name)
+                except KeyError:
+                    pass
+        self.session_cookies.pop(BOOTSTRAP_FAILED_AT_KEY, None)
+
+    def _bootstrap_backoff_remaining(self) -> int:
+        try:
+            failed_at = int(self.session_cookies.get(BOOTSTRAP_FAILED_AT_KEY) or 0)
+        except (TypeError, ValueError):
+            failed_at = 0
+        remaining = failed_at + BOOTSTRAP_RETRY_AFTER_S - int(time.time())
+        return remaining if 0 < remaining <= BOOTSTRAP_RETRY_AFTER_S else 0
+
+    def _remember_bootstrap_failure(self) -> None:
+        self.session_cookies[BOOTSTRAP_FAILED_AT_KEY] = int(time.time())
+
+    async def _ensure_pulse_cookie(self, *, force: bool = False) -> tuple[bool, str | None]:
         """
-        Ensure `.AspNetCore.Cookies` exists in the session.
+        Make sure the client holds Pulse's auth cookie (`Pulse.Auth.Cookie`).
+
+        Pulse issues it when `/api/auth/login` is visited with a live Keycloak session.
+        With `force` the stored cookie is treated as rejected (Pulse answered 401) and a
+        new one is requested. A dead Keycloak session is remembered for a while so that
+        background polling does not replay the SSO round trip on every call.
 
         Returns (ok, error_message).
         """
-        existing = self.client.cookies.get(".AspNetCore.Cookies")
-        if existing:
-            self.session_cookies[".AspNetCore.Cookies"] = existing
+        if not force and self._has_pulse_auth_cookie():
             return True, None
+        if self._bootstrap_backoff_remaining():
+            return False, SESSION_EXPIRED_MESSAGE
 
         breaker = get_breaker("mirea_attendance_grpc")
         decision = await breaker.allow()
@@ -219,69 +308,68 @@ class MireaGrades:
         authz = get_authorization_header(self.session_cookies)
         if authz:
             base_headers["Authorization"] = authz
+        login_params = dict(PULSE_LOGIN_PARAMS)
 
         try:
-            resp = await self.client.get(
-                self.AUTH_LOGIN_URL,
-                params={"redirectUri": "/api/baseinfo"},
-                headers=base_headers,
-            )
+            resp = await self.client.get(self.AUTH_LOGIN_URL, params=login_params, headers=base_headers)
             final_url = str(resp.url)
-            logger.info(f"BRS auth bootstrap: {resp.status_code} final={final_url}")
-
-            # If we ended up on SSO, the session is not authorized anymore.
-            final_host = (httpx.URL(final_url).host or "").lower()
-            if "sso.mirea.ru" in final_host or "login.mirea.ru" in final_host:
-                # Try refresh-token flow first (best-effort). Some upstreams accept Bearer auth
-                # for issuing `.AspNetCore.Cookies`, or gRPC may accept Bearer directly.
-                refreshed = await try_refresh_tokens(self.session_cookies)
-                if refreshed:
-                    authz2 = get_authorization_header(self.session_cookies)
-                    headers2 = dict(base_headers)
-                    if authz2:
-                        headers2["Authorization"] = authz2
-                    try:
-                        resp2 = await self.client.get(
-                            self.AUTH_LOGIN_URL,
-                            params={"redirectUri": "/api/baseinfo"},
-                            headers=headers2,
-                        )
-                        final_url2 = str(resp2.url)
-                        final_host2 = (httpx.URL(final_url2).host or "").lower()
-                        logger.info(f"BRS auth bootstrap retry: {resp2.status_code} final={final_url2}")
-                        aspnet2 = self.client.cookies.get(".AspNetCore.Cookies")
-                        if aspnet2:
-                            self.session_cookies[".AspNetCore.Cookies"] = aspnet2
-                            await breaker.record_success()
-                            return True, None
-                        if "sso.mirea.ru" not in final_host2 and "login.mirea.ru" not in final_host2:
-                            # Upstream responded but didn't set cookie. We'll fall back to Bearer in gRPC headers.
-                            await breaker.record_success()
-                            if authz2:
-                                return True, None
-                        # Still unauthorized after refresh attempt.
-                    except Exception:
-                        pass
-
-                await breaker.record_success()
-                # If we have an access token, allow caller to proceed: gRPC may accept Bearer.
-                if get_authorization_header(self.session_cookies):
-                    return True, None
-                return False, "Сессия истекла. Перелогиньтесь в МИРЭА."
-
-            aspnet = self.client.cookies.get(".AspNetCore.Cookies")
-            if aspnet:
-                self.session_cookies[".AspNetCore.Cookies"] = aspnet
+            fresh = pulse_issued_cookies(self.client.cookies)
+            logger.info("Pulse auth bootstrap: %s host=%s cookies=%s", resp.status_code, httpx.URL(final_url).host, sorted(fresh))
+            if has_pulse_auth_cookie(fresh):
+                self._adopt_pulse_cookies(fresh)
                 await breaker.record_success()
                 return True, None
 
+            # If we ended up on SSO, the Keycloak session is not valid anymore.
+            final_host = (httpx.URL(final_url).host or "").lower()
+            if "sso.mirea.ru" in final_host or "login.mirea.ru" in final_host:
+                # Best effort: a refreshed access token may still get Keycloak to re-issue the session.
+                if await try_refresh_tokens(self.session_cookies):
+                    headers2 = dict(base_headers)
+                    authz2 = get_authorization_header(self.session_cookies)
+                    if authz2:
+                        headers2["Authorization"] = authz2
+                    try:
+                        resp2 = await self.client.get(self.AUTH_LOGIN_URL, params=login_params, headers=headers2)
+                        fresh2 = pulse_issued_cookies(self.client.cookies)
+                        logger.info("Pulse auth bootstrap retry: %s host=%s cookies=%s", resp2.status_code, resp2.url.host, sorted(fresh2))
+                        if has_pulse_auth_cookie(fresh2):
+                            self._adopt_pulse_cookies(fresh2)
+                            await breaker.record_success()
+                            return True, None
+                    except Exception:
+                        pass
+                await breaker.record_success()
+                self._remember_bootstrap_failure()
+                if not force and get_authorization_header(self.session_cookies):
+                    # Let the caller try Bearer auth; a 401 there comes back here with force.
+                    return True, None
+                return False, SESSION_EXPIRED_MESSAGE
+
             # Upstream responded, but didn't give us the cookie (usually auth/session issue).
             await breaker.record_success()
-            return False, "Не удалось получить cookie (.AspNetCore.Cookies). Перелогиньтесь."
+            self._remember_bootstrap_failure()
+            return False, "Не удалось получить cookie авторизации Pulse. Перелогиньтесь."
+        except httpx.TooManyRedirects:
+            # SSO keeps restarting its login flow: the stored Keycloak session is unusable.
+            logger.warning("Pulse auth bootstrap: SSO redirect loop, the stored Keycloak session is unusable")
+            await breaker.record_success()
+            self._remember_bootstrap_failure()
+            return False, SESSION_EXPIRED_MESSAGE
         except Exception as e:
-            logger.warning(f"BRS auth bootstrap failed: {e}")
+            logger.warning(f"Pulse auth bootstrap failed: {e}")
             await breaker.record_failure()
             return False, "МИРЭА не отвечает. Попробуйте позже."
+
+    # Historical name: downstream code (and pymirea <= 0.4) calls the bootstrap by it.
+    _ensure_aspnet_cookie = _ensure_pulse_cookie
+
+    async def _recover_session(self) -> bool:
+        """After Pulse rejected a call: get a fresh auth cookie, else refresh the Keycloak token."""
+        ok, _ = await self._ensure_pulse_cookie(force=True)
+        if ok:
+            return True
+        return await try_refresh_tokens(self.session_cookies)
 
     # --- gRPC-Web helpers ---
 
@@ -396,6 +484,13 @@ class MireaGrades:
                 await breaker.record_failure()
             else:
                 await breaker.record_success()
+            if resp.status_code == 401:
+                # Pulse answers a missing or rejected auth cookie with a bare HTTP 401 (no gRPC
+                # trailers). Renew the session once and repeat; the first request was rejected,
+                # so nothing is done twice.
+                if refresh_retry and await self._recover_session():
+                    return await self._grpc_unary(url, proto_payload, refresh_retry=False)
+                return None, SESSION_EXPIRED_MESSAGE
             return None, f"Ошибка сервера: {resp.status_code}"
 
         raw_content = resp.content or b""
@@ -407,10 +502,8 @@ class MireaGrades:
         grpc_status = trailers.get("grpc-status")
         if grpc_status and grpc_status != "0":
             grpc_message = trailers.get("grpc-message") or "gRPC ошибка"
-            if refresh_retry and grpc_status in {"7", "16"}:
-                refreshed = await try_refresh_tokens(self.session_cookies)
-                if refreshed:
-                    return await self._grpc_unary(url, proto_payload, refresh_retry=False)
+            if refresh_retry and grpc_status in {"7", "16"} and await self._recover_session():
+                return await self._grpc_unary(url, proto_payload, refresh_retry=False)
             await breaker.record_success()
             return None, grpc_message
 
@@ -418,12 +511,10 @@ class MireaGrades:
         if not msgs:
             preview = (raw_content[:300] or b"").decode("utf-8", errors="ignore").lower()
             looks_like_auth = ("<html" in preview or "keycloak" in preview or "login" in preview or "signin" in preview)
-            if looks_like_auth and refresh_retry:
-                refreshed = await try_refresh_tokens(self.session_cookies)
-                if refreshed:
-                    return await self._grpc_unary(url, proto_payload, refresh_retry=False)
+            if looks_like_auth and refresh_retry and await self._recover_session():
+                return await self._grpc_unary(url, proto_payload, refresh_retry=False)
             if looks_like_auth:
-                return None, "Сессия МИРЭА истекла. Перелогиньтесь."
+                return None, SESSION_EXPIRED_MESSAGE
             return None, "Пустой ответ gRPC"
         return msgs[0], None
 
@@ -657,7 +748,7 @@ class MireaGrades:
         if not token:
             return None, "Пустой токен"
 
-        ok, err = await self._ensure_aspnet_cookie()
+        ok, err = await self._ensure_pulse_cookie()
         if not ok:
             return None, err or "Сессия истекла. Перелогиньтесь в МИРЭА."
 
@@ -678,6 +769,15 @@ class MireaGrades:
         return None, "Неизвестный ответ gRPC"
 
     # --- Grades report ---
+
+    def _encode_string_fields(self, fields: list[tuple[int, str]]) -> bytes:
+        out = bytearray()
+        for number, value in fields:
+            b = value.encode("utf-8")
+            out.append((number << 3) | 2)
+            out.extend(self._encode_varint(len(b)))
+            out.extend(b)
+        return bytes(out)
 
     def _encode_grades_request(self, visiting_log_id: str) -> bytes:
         # field 1, wire type 2 (string)
@@ -884,6 +984,7 @@ class MireaGrades:
             key, p = self._decode_varint(data, p)
             field = key >> 3
             wt = key & 0x7
+
             if field == 1 and wt == 2:
                 raw, p = self._read_length_delimited(data, p)
                 parsed_name, parsed_id = self._parse_discipline_info(raw)
@@ -894,8 +995,8 @@ class MireaGrades:
             if field == 2 and wt == 2:
                 raw, p = self._read_length_delimited(data, p)
                 cat_id, score, cap = self._parse_component(raw)
-                if cat_id:
-                    components[cat_id] = float(score) if score is not None else 0.0
+                if cat_id and score is not None:
+                    components[cat_id] = float(score)
                     if cap is not None:
                         component_caps[cat_id] = float(cap)
                 continue
@@ -1493,7 +1594,7 @@ class MireaGrades:
         if not visiting_log_id or not self._UUID_RE.match(visiting_log_id):
             return
 
-        semaphore = asyncio.Semaphore(8)
+        semaphore = asyncio.Semaphore(4)
 
         async def _enrich_subject(subject: Subject) -> None:
             discipline_id = (subject.discipline_id or "").strip()
@@ -1545,58 +1646,240 @@ class MireaGrades:
         except Exception:
             return None
 
+    # --- BRS through the current Pulse API (2026-10) ---
+
+    def _fields(self, data: bytes) -> list[tuple[int, int, object]]:
+        """Decode one protobuf message into (field, wire_type, value) triples; nested messages stay bytes."""
+        out: list[tuple[int, int, object]] = []
+        p = 0
+        while p < len(data):
+            key, p = self._decode_varint(data, p)
+            field, wt = key >> 3, key & 0x7
+            if wt == 0:
+                value, p = self._decode_varint(data, p)
+                out.append((field, wt, int(value)))
+            elif wt == 1 and p + 8 <= len(data):
+                out.append((field, wt, float(struct.unpack("<d", data[p : p + 8])[0])))
+                p += 8
+            elif wt == 2:
+                raw, p = self._read_length_delimited(data, p)
+                out.append((field, wt, raw))
+            else:
+                p = self._skip_field(data, p, wt)
+        return out
+
+    @staticmethod
+    def _sub(fields: list[tuple[int, int, object]], number: int) -> list[bytes]:
+        return [v for f, wt, v in fields if f == number and wt == 2 and isinstance(v, (bytes, bytearray))]
+
+    @staticmethod
+    def _text(fields: list[tuple[int, int, object]], number: int) -> str:
+        for f, wt, v in fields:
+            if f == number and wt == 2:
+                return bytes(v).decode("utf-8", errors="ignore").strip()
+        return ""
+
+    @staticmethod
+    def _number(fields: list[tuple[int, int, object]], number: int) -> float | None:
+        for f, wt, v in fields:
+            if f == number and wt in (0, 1):
+                return float(v)
+        return None
+
+    def _parse_term_plans(self, data: bytes) -> tuple[list[str], dict[str, int], dict[str, int]]:
+        """
+        StudentService.GetStudentTermPlansWithDisciplines → (discipline ids, term by
+        work-plan element id, highest term by discipline id). Planned (future) terms carry
+        no work-plan elements and are skipped: Pulse has no scores for them yet.
+        """
+        discipline_ids: list[str] = []
+        eswpe_term: dict[str, int] = {}
+        discipline_term: dict[str, int] = {}
+        for plan in self._sub(self._fields(data), 1):
+            plan_fields = self._fields(plan)
+            term = int(self._number(plan_fields, 1) or 0)
+            for field_no in (2, 3):  # eswpeDisciplines, dpzDisciplines
+                for entry in self._sub(plan_fields, field_no):
+                    entry_fields = self._fields(entry)
+                    discipline = self._sub(entry_fields, 1)
+                    discipline_id = self._text(self._fields(discipline[0]), 1) if discipline else ""
+                    if not self._UUID_RE.match(discipline_id):
+                        continue
+                    if discipline_id not in discipline_ids:
+                        discipline_ids.append(discipline_id)
+                    discipline_term[discipline_id] = max(term, discipline_term.get(discipline_id, 0))
+                    if field_no == 2:
+                        for element in self._sub(entry_fields, 2):
+                            element_id = self._text(self._fields(element), 1)
+                            if self._UUID_RE.match(element_id):
+                                eswpe_term[element_id] = term
+        return discipline_ids, eswpe_term, discipline_term
+
+    def _parse_lrs_report(self, data: bytes) -> list[_LrsEntry]:
+        """LearnRatingScoreService.GetAttendancesAndLRSByDisciplinesIds → one entry per discipline and semester."""
+        entries: list[_LrsEntry] = []
+        for report in self._sub(self._fields(data), 1):
+            report_fields = self._fields(report)
+            discipline_id = self._text(report_fields, 1)
+            title = self._text(report_fields, 2)
+            for part in self._sub(report_fields, 3):
+                part_fields = self._fields(part)
+                year_part = self._sub(part_fields, 1)
+                year_id = part_id = ""
+                if year_part:
+                    yp = self._fields(year_part[0])
+                    year_id, part_id = self._text(yp, 1), self._text(yp, 2)
+                lessons_ahead = 0
+                for attendance in self._sub(part_fields, 2) + self._sub(part_fields, 3):
+                    lessons_ahead += int(self._number(self._fields(attendance), 1) or 0)
+                for lrs in self._sub(part_fields, 4):
+                    lrs_fields = self._fields(lrs)
+                    max_scores: dict[str, float] = {}
+                    for category in self._sub(lrs_fields, 2):
+                        for score_type in self._sub(self._fields(category), 2):
+                            type_fields = self._fields(score_type)
+                            type_id = self._text(type_fields, 1)
+                            if type_id:
+                                max_scores[type_id] = float(self._number(type_fields, 4) or 0.0)
+                    scores: dict[str, float] = {}
+                    summary_score: float | None = None
+                    info = self._sub(lrs_fields, 4)
+                    if info:
+                        info_fields = self._fields(info[0])
+                        for score in self._sub(info_fields, 1):
+                            score_fields = self._fields(score)
+                            type_id = self._text(score_fields, 1)
+                            value = self._number(score_fields, 2)
+                            if type_id and value is not None:
+                                scores[type_id] = value
+                        summary_score = self._number(info_fields, 2)
+                    entries.append(_LrsEntry(
+                        discipline_id=discipline_id,
+                        title=title,
+                        year_id=year_id,
+                        part_id=part_id,
+                        eswpe_id=self._text(lrs_fields, 1),
+                        scores=scores,
+                        max_scores=max_scores,
+                        summary_score=summary_score,
+                        summary_max=self._number(lrs_fields, 5),
+                        potential_attendance=self._number(lrs_fields, 6),
+                        lessons_ahead=lessons_ahead,
+                    ))
+        return entries
+
+    def _current_semester_entries(
+        self,
+        entries: list[_LrsEntry],
+        eswpe_term: dict[str, int],
+        discipline_term: dict[str, int],
+    ) -> tuple[list[_LrsEntry], int | None]:
+        """Keep the semester in progress: the highest term that already has a score report."""
+        def term_of(entry: _LrsEntry) -> int | None:
+            if entry.eswpe_id in eswpe_term:
+                return eswpe_term[entry.eswpe_id]
+            return discipline_term.get(entry.discipline_id)
+
+        terms = [term_of(e) for e in entries]
+        known = [t for t in terms if t]
+        if known:
+            current = max(known)
+            return [e for e, t in zip(entries, terms) if t == current], current
+        # No term plan to lean on: prefer the semester with lessons still ahead, else the last one seen.
+        groups: dict[tuple[str, str], list[_LrsEntry]] = {}
+        for entry in entries:
+            groups.setdefault((entry.year_id, entry.part_id), []).append(entry)
+        if not groups:
+            return [], None
+        best = max(groups.values(), key=lambda g: (sum(1 for e in g if e.lessons_ahead > 0), len(g)))
+        return best, None
+
+    def _subject_from_entry(self, entry: _LrsEntry) -> Subject:
+        get = lambda type_id: float(entry.scores.get(type_id) or 0.0)  # noqa: E731
+        subject = Subject(
+            name=entry.title or "Дисциплина",
+            discipline_id=entry.discipline_id or None,
+            current_control=get(self._CAT_CURRENT),
+            semester_control=get(self._CAT_SEMESTER),
+            attendance=get(self._CAT_ATTENDANCE),
+            achievements=get(self._CAT_ACHIEVEMENTS),
+            additional=get(self._CAT_ADDITIONAL),
+        )
+        subject.current_control_max = entry.max_scores.get(self._CAT_CURRENT)
+        subject.semester_control_max = entry.max_scores.get(self._CAT_SEMESTER)
+        subject.attendance_max = entry.max_scores.get(self._CAT_ATTENDANCE)
+        subject.achievements_max = entry.max_scores.get(self._CAT_ACHIEVEMENTS)
+        subject.additional_max = entry.max_scores.get(self._CAT_ADDITIONAL)
+        subject.total_max = entry.summary_max
+        if entry.summary_score is not None:
+            subject.total = float(entry.summary_score)
+        else:
+            subject.total = (
+                subject.current_control + subject.semester_control + subject.attendance
+                + subject.achievements + subject.additional
+            )
+        # Pulse reports the points still obtainable from the lessons ahead; the cap is what
+        # attendance can reach at best, never above the category maximum.
+        cap = subject.attendance + float(entry.potential_attendance or 0.0)
+        if subject.attendance_max:
+            cap = min(cap, float(subject.attendance_max))
+        subject.attendance_max_possible = round(cap, 2)
+        return subject
+
     async def get_grades(self, visiting_log_id: str | None = None) -> GradesResult:
         """
-        Получить оценки.
+        Получить оценки за текущий семестр.
 
-        Если visiting_log_id не указан, берём кешированный, иначе выбираем из списка журналов
-        тот, на котором действительно возвращаются данные.
+        Pulse (с 06.10.2026) отдаёт БРС двумя вызовами: план семестров студента и отчёт
+        по списку дисциплин. `visiting_log_id` нужен только для деталей посещаемости и
+        возвращается как `semester`, чтобы интерфейс мог запросить их.
         """
-        ok, err = await self._ensure_aspnet_cookie()
+        ok, err = await self._ensure_pulse_cookie()
         if not ok:
             return GradesResult(
                 success=False,
                 message=err
-                or "БРС недоступен: не удалось получить cookie (.AspNetCore.Cookies). Перелогиньтесь.",
+                or "БРС недоступен: не удалось получить cookie авторизации Pulse. Перелогиньтесь.",
             )
 
-        cached = None
-        if not visiting_log_id:
-            cached = (self.session_cookies.get(self._cache_key) or "").strip() or None
-
-        candidates: list[str] = []
-        if visiting_log_id:
-            candidates = [visiting_log_id]
-        elif cached:
-            candidates = [cached]
-
-        logs: list[str] = []
-        if not candidates:
+        student_id = (self.session_cookies.get(self._student_id_cache_key) or "").strip()
+        log_id = (visiting_log_id or self.session_cookies.get(self._cache_key) or "").strip()
+        if not self._UUID_RE.match(student_id) or not self._UUID_RE.match(log_id):
             logs, err = await self._get_visiting_logs()
-            if err or not logs:
-                return GradesResult(success=False, message=err or "Не удалось получить список журналов")
-            candidates = logs
-        else:
-            # Expand candidates with logs list to auto-recover from stale cached ID.
-            logs, _ = await self._get_visiting_logs()
-            if logs:
-                tail = [x for x in logs if x not in candidates]
-                candidates.extend(tail)
+            if err and not self._UUID_RE.match(student_id):
+                return GradesResult(success=False, message=err)
+            student_id = (self.session_cookies.get(self._student_id_cache_key) or "").strip()
+            if logs and not self._UUID_RE.match(log_id):
+                log_id = logs[0]
+                self.session_cookies[self._cache_key] = log_id
+                self.session_cookies["__brs_visiting_log_cached_at"] = int(time.time())
+        if not self._UUID_RE.match(student_id):
+            return GradesResult(success=False, message="Не удалось определить студента в Pulse")
 
-        last_err = "Не удалось получить оценки"
-        for cand in candidates:
-            subjects, err = await self._fetch_grades_for_log(cand)
-            if subjects:
-                if not visiting_log_id:
-                    # Cache the working visiting log id in the session (internal key).
-                    self.session_cookies[self._cache_key] = cand
-                    self.session_cookies["__brs_visiting_log_cached_at"] = int(time.time())
-                await self._enrich_attendance_caps(subjects, cand)
-                return GradesResult(success=True, message="Оценки получены", subjects=subjects, semester=cand)
-            if err:
-                last_err = err
+        payload, err = await self._grpc_unary(
+            self.TERM_PLANS_URL, self._encode_string_fields([(1, student_id)])
+        )
+        if payload is None:
+            return GradesResult(success=False, message=err or "Не удалось получить план семестров")
+        discipline_ids, eswpe_term, discipline_term = self._parse_term_plans(payload)
+        if not discipline_ids:
+            return GradesResult(success=False, message="В Pulse нет дисциплин для этого студента")
 
-        return GradesResult(success=False, message=last_err)
+        payload, err = await self._grpc_unary(
+            self.LRS_BY_DISCIPLINES_URL,
+            self._encode_string_fields([(1, d) for d in discipline_ids] + [(2, student_id)]),
+        )
+        if payload is None:
+            return GradesResult(success=False, message=err or "Не удалось получить оценки")
+        entries, term = self._current_semester_entries(
+            self._parse_lrs_report(payload), eswpe_term, discipline_term
+        )
+        if not entries:
+            return GradesResult(success=False, message="В Pulse пока нет баллов за текущий семестр")
+        subjects = [self._subject_from_entry(e) for e in entries]
+        subjects.sort(key=lambda s: s.name.lower())
+        logger.info("BRS: %d subjects for term %s", len(subjects), term)
+        return GradesResult(success=True, message="Оценки получены", subjects=subjects, semester=log_id or None)
 
     async def get_attendance_detail(
         self,
@@ -1604,7 +1887,7 @@ class MireaGrades:
         visiting_log_id: str | None = None,
     ) -> AttendanceDetailResult:
         """Fetch per-lesson attendance for one discipline."""
-        ok, err = await self._ensure_aspnet_cookie()
+        ok, err = await self._ensure_pulse_cookie()
         if not ok:
             return AttendanceDetailResult(success=False, message=err or "Сессия истекла.")
 
@@ -1712,11 +1995,8 @@ class MireaGrades:
             wt = key & 0x7
             if wt == 2:
                 outer_raw, p = self._read_length_delimited(data, p)
-                # Response wraps each lesson: outer field 2 → inner field 3 = actual lesson
-                # Try to extract field 3 sub-message from the outer wrapper
                 lesson_raw = self._extract_submessage_field(outer_raw, target_field=3)
                 if lesson_raw is None:
-                    # Fallback: try parsing outer_raw directly as a lesson
                     lesson_raw = outer_raw
                 lesson = self._parse_single_lesson(lesson_raw)
                 if lesson:
@@ -1772,7 +2052,6 @@ class MireaGrades:
                 elif field == 7:
                     teacher = self._parse_teacher_name(raw)
                 elif field == 8:
-                    # Could also be end timestamp in some responses
                     if not end_epoch:
                         end_epoch = self._parse_timestamp_msg(raw)
                 elif field == 10:
@@ -1803,12 +2082,7 @@ class MireaGrades:
         return " ".join(parts)
 
     def _parse_timestamp_msg(self, data: bytes) -> float | None:
-        """Parse a Timestamp sub-message.
-
-        Tries two strategies:
-        1. Google-style: field 1 = seconds (varint), field 2 = nanos (varint)
-        2. Fallback: look for any varint that looks like a unix epoch (> 1e9)
-        """
+        """Parse a Timestamp sub-message (Google-style: field 1=seconds, field 2=nanos)."""
         seconds: int | None = None
         nanos: int = 0
         p = 0
@@ -1830,12 +2104,14 @@ class MireaGrades:
 
     async def get_schedule(self, days: int = 7) -> ScheduleResult:
         """Fetch schedule for the next N days via Pulse LessonService."""
-        ok, err = await self._ensure_aspnet_cookie()
+        ok, err = await self._ensure_pulse_cookie()
         if not ok:
             return ScheduleResult(success=False, message=err or "Auth failed")
 
         all_lessons: list[ScheduleLesson] = []
-        now = datetime.now()
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("Europe/Moscow"))
+        failures = []
 
         sem = asyncio.Semaphore(5)
 
@@ -1844,8 +2120,11 @@ class MireaGrades:
             payload = self._encode_date_request(dt.year, dt.month, dt.day)
             async with sem:
                 raw, grpc_err = await self._grpc_unary(self.LESSONS_URL, payload)
-            if grpc_err or not raw:
+            if grpc_err:
+                failures.append(grpc_err)
                 logger.debug(f"Schedule fetch for {dt.date()}: {grpc_err}")
+                return []
+            if not raw:
                 return []
             return self._parse_lessons_response(raw)
 
@@ -1853,8 +2132,8 @@ class MireaGrades:
         for day_lessons in results:
             all_lessons.extend(day_lessons)
 
-        if not all_lessons:
-            return ScheduleResult(success=False, message="Нет пар в ближайшие дни")
+        if failures:
+            return ScheduleResult(success=False, message="Не удалось загрузить расписание целиком. Попробуйте ещё раз.")
 
         all_lessons.sort(key=lambda l: l.start_epoch or 0)
         return ScheduleResult(success=True, message="OK", lessons=all_lessons)
