@@ -20,6 +20,7 @@ import httpx
 
 from ._http import make_async_client
 from ._settings import settings
+from .exceptions import RaisesForError
 from .pulse_session import SESSION_EXPIRED_MESSAGE, is_pulse_auth_cookie
 from .tokens import get_authorization_header
 from .upstreams import get_breaker
@@ -58,7 +59,7 @@ class AcsEvent:
 
 
 @dataclass
-class AcsResult:
+class AcsResult(RaisesForError):
     success: bool
     message: str
     events: list[AcsEvent]
