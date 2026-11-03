@@ -211,6 +211,23 @@ Config(
 )
 ```
 
+## Ошибки как исключения
+
+Методы возвращают результат с `success` и `message` и не бросают исключений, как и раньше.
+Если удобнее исключения, вызовите `raise_for_error()`:
+
+```python
+from pymirea import MireaRateLimited, MireaSessionExpired
+
+result = await api.mark_attendance(qr)
+try:
+    result.raise_for_error(cookies)  # cookies — тот же dict, что передавали в MireaAPI
+except MireaSessionExpired:
+    ...  # попросить пользователя войти заново
+except MireaRateLimited as e:
+    ...  # повторить через e.retry_after секунд
+```
+
 ## Изменения Пульса в октябре 2026
 
 С 0.5.0 библиотека следует за переразвёртыванием Пульса 6 октября 2026:

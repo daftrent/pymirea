@@ -13,6 +13,15 @@
   cookie возвращал `HTTP 401`, пока сессию не обновлял какой-нибудь другой вызов.
 
 ### Добавлено
+- Типизированные ошибки по желанию: у `AttendanceResult`, `GradesResult`,
+  `ScheduleResult`, `AttendanceDetailResult` и `AcsResult` есть
+  `raise_for_error(cookies)`. При неудаче он бросает `MireaSessionExpired`
+  (надёжно — по метке мёртвой сессии в cookies), `MireaRateLimited` с `retry_after`,
+  `MireaServerError` со `status_code`, `MireaParseFailed` или `MireaError` для
+  отказов вроде «Отметка пока недоступна». Сами методы по-прежнему возвращают
+  результат, а не бросают исключения.
+- `pymirea.error_from_message(message, session_cookies=...)` — та же классификация
+  для собственного кода.
 - `pymirea.grades.renew_pulse_session(cookies)` — общее восстановление сессии Пульса
   для клиентов, которые держат один и тот же dict cookies.
 

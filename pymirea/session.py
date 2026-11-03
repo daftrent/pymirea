@@ -17,11 +17,12 @@ import httpx
 
 from ._http import make_async_client
 from ._settings import settings
+from .exceptions import RaisesForError
 from .tokens import try_refresh_tokens
 
 
 @dataclass
-class AttendanceResult:
+class AttendanceResult(RaisesForError):
     success: bool
     message: str
     user_name: str | None = None
