@@ -183,8 +183,12 @@ def _parse_ical_datetime(value: str) -> Optional[datetime]:
         else:
             dt = datetime.strptime(val, "%Y%m%d")
         if is_utc:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
+            return dt.replace(tzinfo=timezone.utc)
+        if "T" in val:
+            # MIREA's calendars write local times without a zone: they are Moscow time,
+            # whatever the timezone of the machine running the client.
+            return dt.replace(tzinfo=_MSK_TZ)
+        return dt  # an all-day DATE value has no time and no zone
     except Exception:
         return None
 
