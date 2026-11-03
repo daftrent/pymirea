@@ -9,7 +9,7 @@ import hashlib
 import logging
 import re
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
@@ -17,6 +17,7 @@ from bs4 import BeautifulSoup
 
 from ._http import make_async_client
 from ._settings import settings
+from .pulse_session import PULSE_LOGIN_PARAMS, PULSE_LOGIN_URL, has_pulse_auth_cookie
 from .upstreams import get_breaker
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,8 @@ class AuthChallenge:
     # Used for OAuth2 code -> token exchange (PKCE).
     pkce_verifier: str | None = None
     redirect_uri: str | None = None
+    # Preserve host/path scope across OTP in the server-side pending challenge.
+    pulse_cookies: list[dict] | None = None
 
 
 @dataclass
@@ -140,12 +143,7 @@ class MireaAuth:
                     await breaker.record_failure()
                 else:
                     await breaker.record_success()
-                try:
-                    err_body = resp.text[:500]
-                except (UnicodeDecodeError, AttributeError):
-                    err_body = "<unreadable>"
-                logger.warning("Token exchange failed: %s body=%s verifier=%s redirect=%s",
-                               resp.status_code, err_body, bool(code_verifier), redirect_uri[:80] if redirect_uri else None)
+                logger.warning("Token exchange failed: %s", resp.status_code)
                 return None
             body = resp.json()
             if not isinstance(body, dict):
@@ -244,180 +242,157 @@ class MireaAuth:
                 pass
             return None
 
+    @staticmethod
+    def _pulse_url(url: str) -> bool:
+        parsed = urlparse(url)
+        return (parsed.scheme == "https" and parsed.hostname in {"pulse.mirea.ru", "sso.mirea.ru"}
+                and parsed.port in (None, 443) and not parsed.username and not parsed.password)
+
+    async def _pulse_request(self, method: str, url: str, *, data=None, referer=None):
+        # Follow the browser flow, but never forward a password/OTP to a redirect.
+        for _ in range(12):
+            if not self._pulse_url(url):
+                raise ValueError("Unexpected authentication destination")
+            response = await self.client.request(method, url, data=data,
+                headers={"Referer": referer} if referer else {}, follow_redirects=False)
+            if response.status_code not in (301, 302, 303, 307, 308):
+                return response
+            if not response.headers.get("location"):
+                raise ValueError("Missing authentication redirect")
+            if method == "POST" and response.status_code in (307, 308):
+                raise ValueError("Refusing to replay authentication form")
+            referer, url = str(response.url), urljoin(str(response.url), response.headers["location"])
+            method, data = "GET", None
+        raise ValueError("Too many authentication redirects")
+
+    def _pulse_cookie_state(self) -> list[dict]:
+        return [{"name": c.name, "value": c.value, "domain": c.domain, "path": c.path,
+                 "secure": c.secure, "expires": c.expires} for c in self.client.cookies.jar]
+
+    def _restore_pulse_cookies(self, cookies: list[dict]):
+        for item in cookies:
+            self.client.cookies.set(item["name"], item["value"], domain=item["domain"], path=item["path"])
+        for cookie in self.client.cookies.jar:
+            saved = next(c for c in cookies if (c["name"], c["domain"], c["path"]) ==
+                         (cookie.name, cookie.domain, cookie.path))
+            cookie.secure, cookie.expires = saved["secure"], saved["expires"]
+
+    def _pulse_session_cookies(self) -> dict:
+        # Flatten only after the OAuth callback; prefer specific domain/path cookies.
+        result = {}
+        for cookie in sorted(self.client.cookies.jar, key=lambda c: (len(c.domain or ""), len(c.path or ""))):
+            if not cookie.is_expired():
+                result[cookie.name] = cookie.value
+        return result
+
+    async def _pulse_result(self, response) -> AuthResult:
+        skipped_max_enrollment = False
+        for _ in range(5):
+            if response.status_code != 200:
+                return AuthResult(False, "Сервер МИРЭА временно недоступен. Попробуйте позже.")
+            if response.url.host == "pulse.mirea.ru":
+                cookies = self._pulse_session_cookies()
+                if has_pulse_auth_cookie(cookies):
+                    # Telegram identity is verified by the caller; Pulse completed its OAuth callback.
+                    return AuthResult(True, "Авторизация успешна", cookies=cookies)
+                return AuthResult(False, "Не удалось получить сессию Пульса. Начните вход заново.")
+            callback = self._extract_pulse_callback_form(response.text)
+            if callback:
+                # Since 26.10.2026 Pulse asks for response_mode=form_post: a finished login is
+                # an auto-submitting form that hands the one-use code to Pulse, not a redirect.
+                action, fields = callback
+                response = await self._pulse_request("POST", action, data=fields, referer=str(response.url))
+                continue
+            challenge = self._extract_otp_challenge(response.text, base_url=str(response.url))
+            page_id = self._keycloak_page_id(response.text)
+            # Fixed labels only: no HTML, URLs, codes, cookie values or user data.
+            diagnostic_page = page_id if page_id in {
+                "login-otp", "login-max-otp", "email-code-form", "qr-login",
+                "max-account-config", "login-page-expired", "select-authenticator", "error",
+            } else "other"
+            enrollment = bool(re.search(r'"isEnrollment"\s*:\s*true', response.text))
+            can_skip = bool(re.search(r'"showSkip"\s*:\s*true', response.text))
+            phone_unregistered = bool(re.search(r'"phoneNotRegistered"\s*:\s*true', response.text))
+            phone_missing = bool(re.search(r'"noPhoneNumber"\s*:\s*true', response.text))
+            delivery_pending = bool(re.search(r'"deliveryPending"\s*:\s*true', response.text))
+            send_failed = bool(re.search(r'"sendFailed"\s*:\s*true', response.text))
+            # The service intentionally has no INFO/access log; keep this bounded
+            # diagnostic visible while a login is still awaiting confirmation.
+            logger.warning("Pulse auth form: page=%s challenge=%s enrollment=%s skip_offered=%s "
+                           "phone_unregistered=%s phone_missing=%s delivery_pending=%s send_failed=%s",
+                        diagnostic_page, challenge.kind if challenge else "none", enrollment, can_skip,
+                        phone_unregistered, phone_missing, delivery_pending, send_failed)
+            if page_id == "login-max-otp" and (enrollment or phone_unregistered or phone_missing):
+                # The SSO UI offers Skip for enrollment AND for an absent/unregistered
+                # phone, even when isEnrollment=false. Delivery states take precedence
+                # in that UI and do not display Skip. Never skip an actual MAX OTP.
+                action = self._extract_login_action(response.text)
+                if not can_skip or delivery_pending or send_failed or not action or skipped_max_enrollment:
+                    return AuthResult(False, "Завершите настройку аккаунта на сайте Пульса и повторите вход.")
+                skipped_max_enrollment = True
+                response = await self._pulse_request("POST", action, data={"skip": "true"},
+                                                     referer=str(response.url))
+                continue
+            if challenge:
+                if not self._pulse_url(challenge.action_url):
+                    raise ValueError("Unexpected challenge destination")
+                challenge.referer = str(response.url)
+                challenge.pulse_cookies = self._pulse_cookie_state()
+                return AuthResult(False, "Введите код подтверждения.", challenge=challenge)
+            # Retain the existing optional MAX enrollment skip. Never complete
+            # unknown required actions (password change, consent, credential setup).
+            page = re.search(r'"pageId"\s*:\s*"([^"\n]+)"', response.text)
+            if page and page.group(1) in {"max-account-config", "max-account-config.ftl"}:
+                action = self._extract_login_action(response.text)
+                if action:
+                    response = await self._pulse_request("POST", action, data={"skip": "true"},
+                                                         referer=str(response.url))
+                    continue
+            return AuthResult(False, "Не удалось войти. Проверьте данные и повторите попытку.")
+        return AuthResult(False, "Завершите настройку аккаунта на сайте Пульса и повторите вход.")
+
     async def login(self, username: str, password: str) -> AuthResult:
-        """
-        Авторизация с учётными данными МИРЭА
-
-        Args:
-            username: Логин (обычно формата name@edu.mirea.ru или студ. билет)
-            password: Пароль
-
-        Returns:
-            AuthResult с cookies при успехе
-        """
+        # Pulse owns PAR, PKCE and the one-use code exchange. Starting a direct
+        # attendance-app authorization request now fails before the password form.
+        breaker = get_breaker("mirea_sso")
         try:
-            logger.info("=== Keycloak SSO login ===")
-
-            redirect_uri = f"{self.ATTENDANCE_URL}/"
-            pkce_verifier = self._generate_pkce_verifier()
-            pkce_challenge = self._pkce_challenge(pkce_verifier)
-
-            breaker = get_breaker("mirea_sso")
-            decision = await breaker.allow()
-            if not decision.allowed:
-                retry_after = decision.retry_after_s or 5
-                return AuthResult(success=False, message=f"МИРЭА временно недоступна. Попробуйте через {retry_after} сек.")
-
-            # Шаг 1: Открываем Keycloak auth endpoint (SPA страница)
-            auth_page = await self.client.get(
-                f"{self.SSO_URL}/realms/mirea/protocol/openid-connect/auth",
-                params={
-                    "client_id": self.CLIENT_ID,
-                    "redirect_uri": redirect_uri,
-                    "response_type": "code",
-                    "scope": "openid",
-                    # PKCE: some Keycloak setups require it for public clients.
-                    "code_challenge": pkce_challenge,
-                    "code_challenge_method": "S256",
-                }
-            )
-
-            if auth_page.status_code != 200:
-                if 500 <= int(auth_page.status_code) <= 599:
-                    await breaker.record_failure()
-                else:
-                    await breaker.record_success()
-                return AuthResult(success=False, message=f"SSO недоступен: {auth_page.status_code}")
-            await breaker.record_success()
-
-            # Шаг 2: Извлекаем loginAction URL из kcContext в JavaScript
-            login_action = self._extract_login_action(auth_page.text)
-            if not login_action:
-                return AuthResult(success=False, message="Не удалось получить форму входа")
-
-            logger.info(f"loginAction: {login_action[:80]}...")
-
-            # Шаг 3: POST username/password
-            login_response = await self.client.post(
-                login_action,
-                data={"username": username, "password": password},
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Referer": str(auth_page.url),
-                },
-                follow_redirects=False,
-            )
-
-            logger.info(f"Cookies: {list(self.client.cookies.keys())}")
-
-            if login_response.status_code in (302, 303, 307, 308) and login_response.headers.get("location"):
-                location = login_response.headers.get("location") or ""
-                redirect_url = urljoin(str(login_response.url), location)
-                code = self._extract_code_from_url(redirect_url)
-
-                # Keycloak may redirect to a required-action page before issuing the code.
-                if not code and "required-action" in redirect_url:
-                    ra_result = await self._handle_required_actions(
-                        redirect_url,
-                        referer=login_action,
-                        pkce_verifier=pkce_verifier,
-                        redirect_uri=redirect_uri,
-                    )
-                    if ra_result:
-                        return ra_result
-
-                # Exchange authorization code BEFORE following redirect.
-                # Keycloak codes are single-use; the redirect would consume it.
-                all_cookies = dict(self.client.cookies)
-                if code:
-                    tokens = await self._exchange_code_for_token(
-                        code,
-                        code_verifier=pkce_verifier,
-                        redirect_uri=redirect_uri,
-                    )
-                    if tokens:
-                        all_cookies.update(tokens)
-
-                # Now follow redirect to establish server-side session cookie.
-                try:
-                    await self.client.get(
-                        redirect_url,
-                        headers={"Referer": login_action},
-                        follow_redirects=True,
-                    )
-                    all_cookies.update(dict(self.client.cookies))
-                except Exception:
-                    pass
-
-                if all_cookies.get("access_token"):
-                    return AuthResult(success=True, message="Авторизация успешна", cookies=all_cookies)
-                has_session = any(k in all_cookies for k in ('KEYCLOAK_IDENTITY', 'KEYCLOAK_SESSION'))
-                if has_session:
-                    return AuthResult(success=True, message="Авторизация успешна", cookies=all_cookies)
-                if all_cookies:
-                    return AuthResult(success=True, message="Авторизация успешна", cookies=all_cookies)
-                return AuthResult(success=False, message="Не удалось получить сессию")
-
-            final_url = str(login_response.url)
-            logger.info(f"Final URL: {final_url}")
-
-            # Если остались на Keycloak - ошибка авторизации (проверяем хост, не параметры)
-            final_host = urlparse(final_url).hostname or ""
-            if "login-actions" in final_url or final_host == "sso.mirea.ru":
-                # Частый кейс: включена 2FA (OTP), Keycloak покажет вторую форму вместо редиректа.
-                self._log_kc_context(login_response.text)
-                challenge = self._extract_otp_challenge(login_response.text, base_url=final_url)
-                if challenge:
-                    challenge.referer = final_url
-                    challenge.pkce_verifier = pkce_verifier
-                    challenge.redirect_uri = redirect_uri
-                    return AuthResult(
-                        success=False,
-                        message="Требуется код подтверждения (2FA)",
-                        cookies=dict(self.client.cookies),
-                        challenge=challenge,
-                    )
-
-                # Пробуем найти ошибку в kcContext
-                error_msg = self._extract_keycloak_error(login_response.text)
-                return AuthResult(
-                    success=False,
-                    message=error_msg or "Неверный логин или пароль"
-                )
-
-            # Собираем cookies
-            all_cookies = dict(self.client.cookies)
-
-            # Some setups might not redirect (or the final URL keeps the code).
-            code = self._extract_code_from_url(final_url)
-            if code and "access_token" not in all_cookies:
-                tokens = await self._exchange_code_for_token(
-                    code,
-                    code_verifier=pkce_verifier,
-                    redirect_uri=redirect_uri,
-                )
-                if tokens:
-                    all_cookies.update(tokens)
-
-            has_session = any(k in all_cookies for k in ['KEYCLOAK_SESSION', 'KEYCLOAK_IDENTITY', 'sessionid'])
-            if has_session:
-                return AuthResult(success=True, message="Авторизация успешна", cookies=all_cookies)
-
-            # Даже без известных cookies - если нас редиректнуло с Keycloak, считаем успехом
-            if all_cookies:
-                return AuthResult(success=True, message="Авторизация успешна", cookies=all_cookies)
-
-            return AuthResult(success=False, message="Не удалось получить сессию")
-
+            if not (await breaker.allow()).allowed:
+                return AuthResult(False, "МИРЭА временно недоступна. Попробуйте позже.")
+            start_url = str(httpx.URL(PULSE_LOGIN_URL, params=PULSE_LOGIN_PARAMS))
+            page = await self._pulse_request("GET", start_url)
+            if page.status_code >= 500:
+                await breaker.record_failure()
+            else:
+                await breaker.record_success()
+            action = self._extract_login_action(page.text) if page.status_code == 200 else None
+            if page.url.host != "sso.mirea.ru" or not action:
+                return AuthResult(False, "Не удалось получить форму входа МИРЭА. Попробуйте позже.")
+            response = await self._pulse_request("POST", action,
+                # rememberMe asks Keycloak for its longer "remember me" SSO session instead of
+                # the 16-hour default that made every stored session die within a day or two.
+                data={"username": username, "password": password, "credentialId": "", "rememberMe": "on"},
+                referer=str(page.url))
+            return await self._pulse_result(response)
         except httpx.TimeoutException:
-            try:
-                await get_breaker("mirea_sso").record_failure()
-            except Exception:
-                pass
-            return AuthResult(success=False, message="Сервер МИРЭА не отвечает")
-        except Exception as e:
-            logger.error(f"Login error: {e}")
-            return AuthResult(success=False, message="Внутренняя ошибка")
+            await breaker.record_failure()
+            return AuthResult(False, "Сервер МИРЭА не отвечает")
+        except Exception:
+            # Never return upstream exceptions: URLs can contain OAuth secrets.
+            return AuthResult(False, "Не удалось выполнить вход МИРЭА. Попробуйте позже.")
+
+    async def _submit_pulse_otp(self, challenge: AuthChallenge, code: str) -> AuthResult:
+        try:
+            self._restore_pulse_cookies(challenge.pulse_cookies or [])
+            payload = {**challenge.hidden_fields, challenge.field_name: code.strip()}
+            if not payload[challenge.field_name]:
+                return AuthResult(False, "Введите код подтверждения")
+            response = await self._pulse_request("POST", challenge.action_url, data=payload,
+                                                 referer=challenge.referer or challenge.action_url)
+            return await self._pulse_result(response)
+        except httpx.TimeoutException:
+            return AuthResult(False, "Сервер МИРЭА не отвечает")
+        except Exception:
+            return AuthResult(False, "Не удалось подтвердить вход. Начните заново.")
 
     @staticmethod
     def _log_kc_context(html: str) -> None:
@@ -425,7 +400,7 @@ class MireaAuth:
         try:
             page_id = re.search(r'"pageId"\s*:\s*"([^"]+)"', html)
             if page_id:
-                logger.info("kcContext pageId: %s", page_id.group(1))
+                pass
 
             # Dump raw HTML around kcContext (first <script> block with pageId).
             # The kcContext is embedded as a JS object in a <script> tag.
@@ -435,12 +410,11 @@ class MireaAuth:
                 start = max(0, script_idx - 200)
                 chunk = html[start:start+5000].replace('\n', ' ').replace('\r', ' ')
                 chunk = re.sub(r'\s+', ' ', chunk)
-                logger.info("kcContext raw: %s", chunk)
 
             # Log any message/error
             msg = re.search(r'"message"\s*:\s*"([^"]*)"', html)
             if msg:
-                logger.info("kcContext message: %s", msg.group(1))
+                pass
         except Exception:
             pass
 
@@ -467,6 +441,25 @@ class MireaAuth:
             return msg
         return None
 
+    def _extract_pulse_callback_form(self, html: str) -> tuple[str, dict[str, str]] | None:
+        """Keycloak form_post page: an auto-submitting form to Pulse's OAuth callback."""
+        if '"pageId"' in html:
+            return None
+        form = BeautifulSoup(html, "html.parser").find("form", action=True)
+        if not form or (form.get("method") or "").lower() != "post":
+            return None
+        action = form["action"].strip()
+        # The code is only ever handed to Pulse itself, never to SSO or a foreign host.
+        if not self._pulse_url(action) or urlparse(action).hostname != "pulse.mirea.ru":
+            return None
+        fields = {i["name"]: i.get("value") or "" for i in form.find_all("input") if i.get("name")}
+        return (action, fields) if "code" in fields or "error" in fields else None
+
+    @staticmethod
+    def _keycloak_page_id(html: str) -> str | None:
+        page = re.search(r'"pageId"\s*:\s*"([^"\n]+)"', html)
+        return page.group(1).removesuffix(".ftl") if page else None
+
     def _extract_otp_challenge(self, html: str, *, base_url: str | None = None) -> AuthChallenge | None:
         """
         Detect Keycloak OTP step and extract form action + hidden fields.
@@ -474,41 +467,25 @@ class MireaAuth:
         Supports both SPA (kcContext JavaScript) and classic HTML form pages.
         """
         try:
-            # SPA detection: Keycloak SPA pages have "otpLogin" or "login-max-otp" in kcContext
-            if '"otpLogin"' in html:
+            # kcContext contains metadata for OTHER available authenticators too.
+            # Only pageId identifies the currently displayed form; a global search
+            # for "login-max-otp" can misclassify an email challenge as MAX.
+            page_id = self._keycloak_page_id(html)
+            formats = {
+                "login-otp": ("otp", "otp", {}),
+                "login-max-otp": ("otp", "code", {"login": "true"}),
+                "email-code-form": ("email_code", "emailCode", {"login": "true"}),
+            }
+            selected = formats.get(page_id)
+            # Retain support for old minimal contexts without a pageId at all.
+            if page_id is None and re.search(r'"otpLogin"\s*:\s*(?:true|\{)', html):
+                selected = formats["login-otp"]
+            if selected:
                 action_url = self._extract_login_action(html)
                 if action_url:
-                    logger.info("OTP challenge detected from kcContext SPA")
-                    return AuthChallenge(
-                        kind="otp",
-                        action_url=action_url,
-                        field_name="otp",
-                        hidden_fields={},
-                    )
-
-            # MAX OTP (SMS-based 2FA via MAX messenger)
-            if '"login-max-otp"' in html:
-                action_url = self._extract_login_action(html)
-                if action_url:
-                    logger.info("MAX OTP challenge detected from kcContext SPA")
-                    return AuthChallenge(
-                        kind="otp",
-                        action_url=action_url,
-                        field_name="code",
-                        hidden_fields={"login": "true"},
-                    )
-
-            # Email code 2FA (code sent to user's @edu.mirea.ru email)
-            if '"email-code-form"' in html:
-                action_url = self._extract_login_action(html)
-                if action_url:
-                    logger.info("Email code challenge detected from kcContext SPA")
-                    return AuthChallenge(
-                        kind="email_code",
-                        action_url=action_url,
-                        field_name="emailCode",
-                        hidden_fields={},
-                    )
+                    kind, field_name, hidden_fields = selected
+                    return AuthChallenge(kind=kind, action_url=action_url,
+                                         field_name=field_name, hidden_fields=hidden_fields)
 
             # Fallback: classic HTML form parsing
             soup = BeautifulSoup(html, "html.parser")
@@ -639,12 +616,10 @@ class MireaAuth:
             if "required-action" not in url:
                 return None
 
-            logger.info("Keycloak required-action detected: %s", url[:120])
 
             try:
                 page_resp = await self.client.get(url, headers={"Referer": referer}, follow_redirects=False)
             except Exception as e:
-                logger.warning("required-action GET failed: %s", e)
                 return None
 
             # If the required-action itself redirects (e.g., to the app with code), follow it.
@@ -664,11 +639,6 @@ class MireaAuth:
                         pass
                     if all_cookies.get("access_token"):
                         return AuthResult(success=True, message="Авторизация успешна", cookies=all_cookies)
-                    # Token exchange failed but we may have session cookies (.AspNetCore.Cookies etc.)
-                    has_session = any(k in all_cookies for k in ('.AspNetCore.Cookies', 'KEYCLOAK_IDENTITY', 'KEYCLOAK_SESSION'))
-                    if has_session or all_cookies:
-                        logger.info("required-action: token exchange failed but have session cookies, declaring success")
-                        return AuthResult(success=True, message="Авторизация успешна", cookies=all_cookies)
                 # No code — keep following
                 url = next_url
                 referer = url
@@ -680,17 +650,18 @@ class MireaAuth:
 
             action_url = self._extract_login_action(html)
             if not action_url:
-                logger.warning("required-action: no loginAction found, cannot skip")
                 return None
 
             # Try to skip/cancel the required action.
             # MIREA theme uses hidden input name="skip" value="true" in kc-max-otp-skip-form.
+            orig_page_id_m = re.search(r'"pageId"\s*:\s*"([^"]+)"', html)
+            orig_page_id = orig_page_id_m.group(1) if orig_page_id_m else None
+
             skip_payloads = [
                 {"skip": "true"},
                 {"cancel-aia": "true"},
             ]
             for payload in skip_payloads:
-                logger.info("Attempting to skip required-action with %s to %s", payload or "{}", action_url[:100])
                 try:
                     skip_resp = await self.client.post(
                         action_url,
@@ -699,19 +670,18 @@ class MireaAuth:
                         follow_redirects=False,
                     )
                 except Exception as e:
-                    logger.warning("required-action POST failed: %s", e)
                     continue
 
                 if skip_resp.status_code in (302, 303, 307, 308):
                     location = skip_resp.headers.get("location", "")
                     next_url = urljoin(str(skip_resp.url), location)
-                    logger.info("required-action skip redirected to: %s", next_url[:120])
                     code = self._extract_code_from_url(next_url)
                     if code:
                         all_cookies = dict(self.client.cookies)
                         tokens = await self._exchange_code_for_token(code, code_verifier=pkce_verifier, redirect_uri=redirect_uri)
                         if tokens:
                             all_cookies.update(tokens)
+                        # Follow the redirect to pulse.mirea.ru to establish its session cookie
                         try:
                             await self.client.get(next_url, headers={"Referer": action_url}, follow_redirects=True)
                             all_cookies.update(dict(self.client.cookies))
@@ -719,13 +689,13 @@ class MireaAuth:
                             pass
                         if all_cookies.get("access_token"):
                             return AuthResult(success=True, message="Авторизация успешна", cookies=all_cookies)
-                        # Token exchange failed (confidential client) — try to bootstrap
-                        # .AspNetCore.Cookies via pulse auth endpoint using the KC session.
-                        # Without this cookie, downstream Pulse API calls return 401.
+                        # Token exchange failed (confidential client), but we may have KC cookies.
+                        # Try to bootstrap the Pulse auth cookie via pulse auth endpoint.
                         has_kc = any(k in all_cookies for k in ("KEYCLOAK_IDENTITY", "KEYCLOAK_SESSION"))
                         if has_kc:
-                            logger.info("required-action: token exchange failed but have KC cookies, trying aspnet bootstrap")
                             try:
+                                # Build a fresh client with only KC cookies needed for pulse auth
+                                import httpx as _httpx
                                 kc_cookie_names = ("KEYCLOAK_IDENTITY", "KEYCLOAK_SESSION")
                                 cookie_header_parts = []
                                 for cn in kc_cookie_names:
@@ -735,41 +705,56 @@ class MireaAuth:
                                 cookie_header = "; ".join(cookie_header_parts)
                                 async with make_async_client(
                                     follow_redirects=True,
-                                    timeout=httpx.Timeout(15.0, connect=8.0),
+                                    timeout=_httpx.Timeout(15.0, connect=8.0),
                                     headers={
                                         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
                                         "Referer": "https://pulse.mirea.ru/",
                                         "Cookie": cookie_header,
                                     },
-                                    transport=httpx.AsyncHTTPTransport(retries=2),
+                                    transport=_httpx.AsyncHTTPTransport(retries=2),
                                 ) as bootstrap_client:
-                                    bootstrap_resp = await bootstrap_client.get(
-                                        "https://pulse.mirea.ru/api/auth/login",
-                                        params={"redirectUri": "/api/baseinfo"},
-                                    )
+                                    await bootstrap_client.get(PULSE_LOGIN_URL, params=PULSE_LOGIN_PARAMS)
                                     for name, value in bootstrap_client.cookies.items():
                                         all_cookies[name] = value
-                                    aspnet = bootstrap_client.cookies.get(".AspNetCore.Cookies")
-                                    if aspnet:
-                                        all_cookies[".AspNetCore.Cookies"] = aspnet
-                                        logger.info("required-action: got .AspNetCore.Cookies via bootstrap")
-                                    else:
-                                        logger.warning(
-                                            "required-action: bootstrap did not yield .AspNetCore.Cookies, final_url=%s",
-                                            str(bootstrap_resp.url)[:150],
-                                        )
-                            except (httpx.NetworkError, httpx.TimeoutException, httpx.HTTPError) as e:
-                                logger.warning("required-action: aspnet bootstrap failed: %s", type(e).__name__)
-                            return AuthResult(success=True, message="Авторизация успешна", cookies=all_cookies)
-                        if all_cookies:
-                            logger.info("required-action skip: token exchange failed but have cookies, declaring success")
+                                    # The Pulse auth cookie (`Pulse.Auth.Cookie`, formerly `.AspNetCore.Cookies`)
+                                    # is now among all_cookies when the Keycloak session was accepted.
+                            except Exception as e:
+                                pass
                             return AuthResult(success=True, message="Авторизация успешна", cookies=all_cookies)
                     # Another redirect — might be another required-action or next step
                     url = next_url
                     referer = action_url
                     break  # break skip_payloads loop, continue outer loop
                 else:
-                    logger.info("required-action skip returned %s, trying next approach", skip_resp.status_code)
+                    # Skip returned 200 — check if Keycloak advanced to a new page
+                    # (some required actions render the next step inline instead of redirecting).
+                    skip_html = skip_resp.text
+                    skip_pid_m = re.search(r'"pageId"\s*:\s*"([^"]+)"', skip_html)
+                    skip_page_id = skip_pid_m.group(1) if skip_pid_m else None
+
+                    if skip_page_id and skip_page_id != orig_page_id:
+                        if skip_page_id == "login-page-expired":
+                            return None
+                        # Page changed — extract challenge from the NEW page
+                        self._log_kc_context(skip_html)
+                        new_challenge = self._extract_otp_challenge(skip_html, base_url=str(skip_resp.url))
+                        if new_challenge:
+                            new_challenge.referer = str(skip_resp.url)
+                            new_challenge.pkce_verifier = pkce_verifier
+                            new_challenge.redirect_uri = redirect_uri
+                            return AuthResult(
+                                success=False,
+                                message="Требуется код подтверждения (2FA)",
+                                cookies=dict(self.client.cookies),
+                                challenge=new_challenge,
+                            )
+                        # New page but no challenge — update and continue outer loop
+                        new_action = self._extract_login_action(skip_html)
+                        if new_action:
+                            url = str(skip_resp.url)
+                            referer = action_url
+                            break  # continue outer loop with new page
+
                     continue
             else:
                 # All skip approaches returned non-redirect — fall back to OTP challenge.
@@ -778,16 +763,14 @@ class MireaAuth:
                     otp_challenge.referer = str(page_resp.url)
                     otp_challenge.pkce_verifier = pkce_verifier
                     otp_challenge.redirect_uri = redirect_uri
-                    logger.info("required-action: skip failed, returning OTP challenge (kind=%s)", otp_challenge.kind)
                     return AuthResult(
                         success=False,
                         message="Требуется код подтверждения (2FA)",
                         cookies=dict(self.client.cookies),
                         challenge=otp_challenge,
                     )
-                logger.warning("required-action: all skip attempts failed, no OTP fallback")
                 return None
-            return None
+            continue  # continue outer loop after break from inner loop
 
         return None
 
@@ -797,6 +780,13 @@ class MireaAuth:
 
         `challenge` should be returned by `_extract_otp_challenge`.
         """
+        # Also repair pending email challenges created before this form update.
+        # MIREA's JS submit handler adds login=true; emailCode alone is not submitted as a login.
+        if challenge.kind == "email_code" and challenge.field_name == "emailCode":
+            challenge = replace(challenge, hidden_fields={**challenge.hidden_fields, "login": "true"})
+        if challenge.pulse_cookies is not None:
+            return await self._submit_pulse_otp(challenge, otp_code)
+        # Pending challenges created before the PAR rollout retain their old flow.
         try:
             if cookies:
                 self.client.cookies.update(cookies)
@@ -860,14 +850,14 @@ class MireaAuth:
                 except Exception:
                     pass
 
+                # Only declare success if we actually obtained tokens.
                 if all_cookies.get("access_token"):
                     return AuthResult(success=True, message="Авторизация успешна", cookies=all_cookies)
-                has_session = any(k in all_cookies for k in ('.AspNetCore.Cookies', 'KEYCLOAK_IDENTITY', 'KEYCLOAK_SESSION'))
+                # We have cookies but no access_token — session is incomplete.
+                has_session = any(k in all_cookies for k in ('KEYCLOAK_IDENTITY', 'KEYCLOAK_SESSION'))
                 if has_session:
                     return AuthResult(success=True, message="Авторизация успешна", cookies=all_cookies)
-                if all_cookies:
-                    return AuthResult(success=True, message="Авторизация успешна", cookies=all_cookies)
-                return AuthResult(success=False, message="Не удалось получить сессию")
+                return AuthResult(success=False, message="Не удалось получить токены. Попробуйте войти заново.")
 
             final_url = str(resp.url)
             final_host = urlparse(final_url).hostname or ""
@@ -910,8 +900,7 @@ class MireaAuth:
                 pass
             return AuthResult(success=False, message="Сервер МИРЭА не отвечает")
         except Exception as e:
-            logger.error(f"OTP submit error: {e}")
-            return AuthResult(success=False, message="Внутренняя ошибка")
+            return AuthResult(success=False, message=f"Ошибка: {str(e)}")
 
     async def complete_2fa(self, challenge: AuthChallenge, code: str, *, cookies: dict | None = None) -> AuthResult:
         """Alias for :meth:`submit_otp` — name used in README/examples."""
