@@ -20,7 +20,8 @@ import httpx
 
 from ._http import make_async_client
 from ._settings import settings
-from .tokens import get_authorization_header, try_refresh_tokens
+from .pulse_session import SESSION_EXPIRED_MESSAGE, is_pulse_auth_cookie
+from .tokens import get_authorization_header
 from .upstreams import get_breaker
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,23 @@ class MireaACS:
 
     async def close(self):
         await self.client.aclose()
+
+    async def _recover_session(self) -> bool:
+        """Renew the Pulse session (shared with MireaGrades) and load the new cookie into this client."""
+        from .grades import renew_pulse_session
+
+        if not await renew_pulse_session(self.session_cookies):
+            return False
+        jar = self.client.cookies.jar
+        for cookie in [c for c in jar if is_pulse_auth_cookie(c.name or "")]:
+            try:
+                jar.clear(cookie.domain, cookie.path, cookie.name)
+            except KeyError:
+                pass
+        for name, value in self.session_cookies.items():
+            if value and is_pulse_auth_cookie(str(name)):
+                self.client.cookies.set(str(name), str(value), domain=".mirea.ru")
+        return True
 
     def _grpc_headers(self) -> dict:
         headers = {
@@ -203,6 +221,17 @@ class MireaACS:
                 await breaker.record_failure()
             else:
                 await breaker.record_success()
+            if resp.status_code == 401:
+                # Pulse answers a missing or rejected auth cookie with a bare 401. Renew the
+                # session once and repeat; the first request was rejected, nothing is done twice.
+                if refresh_retry and await self._recover_session():
+                    return await self._grpc_unary(
+                        url,
+                        proto_payload,
+                        allow_empty_message=allow_empty_message,
+                        refresh_retry=False,
+                    )
+                return None, SESSION_EXPIRED_MESSAGE
             return None, f"HTTP {resp.status_code}"
 
         raw_content = resp.content or b""
@@ -215,8 +244,7 @@ class MireaACS:
         if grpc_status and grpc_status != "0":
             grpc_message = trailers.get("grpc-message") or "gRPC error"
             if refresh_retry and grpc_status in {"7", "16"}:
-                refreshed = await try_refresh_tokens(self.session_cookies)
-                if refreshed:
+                if await self._recover_session():
                     return await self._grpc_unary(
                         url,
                         proto_payload,
@@ -229,8 +257,7 @@ class MireaACS:
             preview = (raw_content[:300] or b"").decode("utf-8", errors="ignore").lower()
             looks_like_auth = ("<html" in preview or "keycloak" in preview or "login" in preview or "signin" in preview)
             if looks_like_auth and refresh_retry:
-                refreshed = await try_refresh_tokens(self.session_cookies)
-                if refreshed:
+                if await self._recover_session():
                     return await self._grpc_unary(
                         url,
                         proto_payload,
@@ -239,7 +266,7 @@ class MireaACS:
                     )
             if looks_like_auth:
                 await breaker.record_success()
-                return None, "Сессия МИРЭА истекла. Перелогиньтесь."
+                return None, SESSION_EXPIRED_MESSAGE
             if allow_empty_message:
                 await breaker.record_success()
                 return b"", None
